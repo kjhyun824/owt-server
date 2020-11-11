@@ -241,6 +241,11 @@ var Conference = function (rpcClient, selfRpcId) {
   var streams = {};
 
   /*
+   *  {viewLabel: number(lastPageNumber)}
+   */
+  var last_page_numbers = {};
+
+  /*
    * {
    *   SubscriptionId: {
    *     id: string(SubscriptionId),
@@ -385,7 +390,9 @@ var Conference = function (rpcClient, selfRpcId) {
                   is_initializing = false;
 
                   room_config.views.forEach((viewSettings) => {
-                    var mixed_stream_id = room_id + '-' + viewSettings.label;
+                    last_page_numbers[viewSettings.label] = roomController.getFirstPageNumber();
+
+                    var mixed_stream_id = roomController.getMixStreamOfPage(viewSettings.label, last_page_numbers[viewSettings.label]);
                     var av_capability = roomController.getViewCapability(viewSettings.label);
 
                     if (!av_capability) {
@@ -393,7 +400,7 @@ var Conference = function (rpcClient, selfRpcId) {
                       return;
                     }
 
-                    var mixed_stream_info = Stream.createMixStream(room_id, viewSettings, room_config.mediaOut, av_capability);
+                    var mixed_stream_info = Stream.createMixStream(mixed_stream_id, viewSettings, room_config.mediaOut, av_capability);
 
                     streams[mixed_stream_id] = mixed_stream_info;
                     log.debug('Mixed stream info:', mixed_stream_info);
@@ -1336,6 +1343,77 @@ var Conference = function (rpcClient, selfRpcId) {
       });
   };
 
+  const addPage = function(view, viewSettings, on_ok) {
+    log.info('addPage view:', view, 'viewSettings:', viewSettings);
+    last_page_numbers[view] += 1;
+
+    let target_template = undefined;
+
+    // Remove unncessary templates
+    viewSettings.video.layout.templates.forEach((template) => {
+      if(template.region.length < viewSettings.video.maxInput) {
+        const idx = viewSettings.video.layout.templates.indexOf(template);
+        viewSettings.video.layout.templates.splice(idx, 1);
+      } else {
+        if(target_template === undefined || target_template.region.length > template.region.length) {
+          if(target_template !== undefined) {
+            const idx = viewSettings.video.layout.templates.indexOf(target_template);
+            viewSettings.video.layout.templates.splice(idx, 1);
+          }
+          target_template = template;
+        }
+      }
+    });
+
+    roomController.addPage(viewSettings, last_page_numbers[view], 
+      function onOk() {
+        const added_view_label = roomController.getPageLabel(view, last_page_numbers[view]);
+        const mixed_stream_id = roomController.getMixStreamOfPage(view, last_page_numbers[view]);
+        const av_capability = roomController.getViewCapability(added_view_label);
+        if (!av_capability) {
+          log.error('No audio/video capability for view: ' + added_view_label);
+          return;
+        }
+
+        var mixed_stream_info = Stream.createMixStream(mixed_stream_id, viewSettings, room_config.mediaOut, av_capability);
+				streams[mixed_stream_id] = mixed_stream_info;
+				log.info('Added Page stream info:', mixed_stream_info);
+        room_config.notifying.streamChange & 
+          sendMsg('room', 'all', 'stream', {id: mixed_stream_id, status: 'add', data: Stream.toPortalFormat(mixed_stream_info)});
+
+				on_ok();
+      }, 
+      function onError() {
+        log.error("Page Addition Failed");
+        last_page_numbers[view] -= 1;
+      });
+  }
+
+  const removeLastPage = function(view, streamId, layout) {
+    if(last_page_numbers[view] === roomController.getFirstPageNumber()) {
+      room_config.notifying.streamChange && sendMsg('room', 'all', 'stream', {status: 'update', id: streamId, data: {field: 'video.layout', value: layout}});
+      return; // Remove except first page
+    }
+
+    let last_stream_id = roomController.getMixStreamOfPage(view, last_page_numbers[view]);
+    let current_num_streams = streams[last_stream_id].info.layout.filter(obj => obj.stream).length;
+
+    if(current_num_streams === 0) {
+      removeStream(last_stream_id).then(() => {
+        // Resolve
+        roomController.removePage(view, last_page_numbers[view], 
+          function onOk() {
+            last_page_numbers[view] -= 1;
+          });
+      }, () => {
+        // Reject
+        log.error('Remove Last Page Stream Failed');
+      })
+    } else {
+      room_config.notifying.streamChange && sendMsg('room', 'all', 'stream', {status: 'update', id: streamId, data: {field: 'video.layout', value: layout}});
+    }
+  }
+
   const mix = function(streamId, toView) {
     if (streams[streamId].isInConnecting) {
       return Promise.reject('Stream is NOT ready');
@@ -1345,17 +1423,36 @@ var Conference = function (rpcClient, selfRpcId) {
       return Promise.resolve('ok');
     }
 
-    return new Promise((resolve, reject) => {
-      roomController.mix(streamId, toView, function() {
-        if (streams[streamId].info.inViews.indexOf(toView) === -1) {
-          streams[streamId].info.inViews.push(toView);
-        }
-        resolve('ok');
-      }, function(reason) {
-        log.info('roomController.mix failed, reason:', reason);
-        reject(reason);
-      });
-    });
+    let last_stream_id = roomController.getMixStreamOfPage(toView, last_page_numbers[toView]);
+    let current_num_streams = streams[last_stream_id].info.layout.filter(obj => obj.stream).length;
+    let target_view_settings = room_config.views.filter(obj => obj.label === toView)[0];
+
+    log.info('mix current_num_streams:', current_num_streams, 'target_view_settings.video.maxInput:', target_view_settings.video.maxInput);
+
+		const tryMix = function() {
+			return new Promise((resolve, reject) => {
+				roomController.mix(streamId, toView, last_page_numbers[toView], function() {
+					if (streams[streamId].info.inViews.indexOf(toView) === -1) {
+						streams[streamId].info.inViews.push(toView);
+					}
+					resolve('ok');
+				}, function(reason) {
+					log.info('roomController.mix failed, reason:', reason);
+
+					if(reason === 'Video mixer is NOT ready.' || reason === 'addInput reach max input.') { // Retry on Mixer Init or Max Input
+						mix(streamId, toView);
+					} else {
+						reject(reason);
+					}
+				}, false);
+			});
+		}
+
+    if(current_num_streams >= target_view_settings.video.maxInput) { // Full
+			addPage(toView, target_view_settings, tryMix);
+    } else {
+			tryMix();
+		}
   };
 
   const unmix = function(streamId, fromView) {
@@ -1663,13 +1760,40 @@ var Conference = function (rpcClient, selfRpcId) {
     }
   };
 
-  that.onVideoLayoutChange = function(roomId, layout, view, callback) {
+  // get a stream from the next page
+  var fillPage = function (view, page_number, streamId, layout) {
+    log.info('fillPage view:', view, 'page_number:', page_number, 'last_page_numbers[view]:', last_page_numbers[view]);
+    if (page_number >= last_page_numbers[view]) {
+      return removeLastPage(view, streamId, layout);
+    }
+
+    const region_id = '1'; // move a stream to the current page from the next page with region_id
+    roomController.fillPage(view, page_number, page_number + 1, region_id, function onFillPage () {
+      log.info('fillPage.onFillPage success');
+    }, function onFillPageFailed (reason) {
+      log.info('fillPage.onFillPageFailed reason:', reason);
+      fillPage(view, page_number);
+    });
+    return;
+  }
+
+  that.onVideoLayoutChange = function(roomId, layout, view, page_number, callback) {
+    log.info('onVideoLayoutChange roomId:', roomId, 'view:', view, 'page_number:', page_number);
     log.debug('onVideoLayoutChange, roomId:', roomId, 'layout:', layout, 'view:', view);
     if (room_id === roomId && roomController) {
-      var streamId = roomController.getMixedStream(view);
+      var streamId = roomController.getMixStreamOfPage(view, page_number);
       if (streams[streamId]) {
+        var prev = streams[streamId].info.layout.filter(obj => obj.stream).length;
+        var curr = layout.filter(obj => obj.stream).length;
+        log.info('onVideoLayoutChange prev:', prev, 'curr:', curr);
+
         streams[streamId].info.layout = layout;
-        room_config.notifying.streamChange && sendMsg('room', 'all', 'stream', {status: 'update', id: streamId, data: {field: 'video.layout', value: layout}});
+
+        if (curr < prev) {
+          fillPage(view, page_number, streamId, layout);
+        } else {
+          room_config.notifying.streamChange && sendMsg('room', 'all', 'stream', {status: 'update', id: streamId, data: {field: 'video.layout', value: layout}});
+        }
         callback('callback', 'ok');
       } else {
         callback('callback', 'error', 'no mixed stream.');

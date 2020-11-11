@@ -110,8 +110,7 @@ const calcResolution = (x, baseResolution) => {
   return {width: 65536, height: 65536};
 };
 
-function createMixStream(roomId, viewSettings, mediaOut, avCapability) {
-  var mixedStreamId = roomId + '-' + viewSettings.label;
+function createMixStream(mixedStreamId, viewSettings, mediaOut, avCapability) {
   var defaultAudiofmt = null;
   var defaultVideofmt = null;
 

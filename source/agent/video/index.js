@@ -76,7 +76,7 @@ class InputManager {
         return (this.inputs[streamId] || this.pendingInputs[streamId]);
     }
 
-    add(streamId, codec, conn, avatar) {
+    add(streamId, codec, conn, avatar, usePending = true) {
         if (this.inputs[streamId])
             return -1;
 
@@ -88,7 +88,8 @@ class InputManager {
             primaryCount: 0
         };
         if (input.id === undefined) {
-            this.pendingInputs[streamId] = input;
+            if (usePending)
+                this.pendingInputs[streamId] = input;
             return -1;
         } else {
             this.inputs[streamId] = input;
@@ -186,6 +187,7 @@ function VMixer(rpcClient, clusterIP) {
         belong_to,
         controller,
         view,
+        page,
 
         drawing_text_tmr,
 
@@ -229,7 +231,8 @@ function VMixer(rpcClient, clusterIP) {
             // Use default avatar if it is not set
             avatar = avatar || global.config.avatar.location;
 
-            let inputId = inputManager.add(stream_id, codec, conn, avatar);
+            const usePending = (options.usePending === undefined) ? true : options.usePending;
+            let inputId = inputManager.add(stream_id, codec, conn, avatar, usePending);
             if (inputId >= 0) {
                 if (engine.addInput(inputId, codec, conn, avatar)) {
                     layoutProcessor.addInput(inputId);
@@ -240,8 +243,13 @@ function VMixer(rpcClient, clusterIP) {
                     on_error('Failed in adding input to video-engine.');
                 }
             } else {
-                log.debug('addInput pending', stream_id);
-                on_ok(stream_id);
+                if (usePending) {
+                    log.info('addInput pending', stream_id);
+                    on_ok(stream_id);
+                } else {
+                    log.info('addInput reach max input.', stream_id);
+                    on_error('addInput reach max input.');
+                }
             }
         } else {
             on_error('Video-mixer engine is not ready.');
@@ -357,7 +365,7 @@ function VMixer(rpcClient, clusterIP) {
         });
     };
 
-    that.initialize = function (videoConfig, belongTo, layoutcontroller, mixView, callback) {
+    that.initialize = function (videoConfig, belongTo, layoutcontroller, mixView, pageNum, callback) {
         log.debug('initEngine, videoConfig:', JSON.stringify(videoConfig));
         var config = {
             'hardware': useHardware,
@@ -385,13 +393,14 @@ function VMixer(rpcClient, clusterIP) {
             }
 
             var streamRegions = formatLayoutSolution(layoutSolution);
-            var layoutChangeArgs = [belong_to, streamRegions, view];
+            var layoutChangeArgs = [belong_to, streamRegions, view, page];
             rpcClient.remoteCall(controller, 'onVideoLayoutChange', layoutChangeArgs);
         });
         belong_to = belongTo;
         controller = layoutcontroller;
         maxInputNum = videoConfig.maxInput;
         view = mixView;
+        page = pageNum;
 
         // FIXME: The supported codec list should be a sub-list of those querried from the engine
         // and filterred out according to config.
@@ -662,6 +671,18 @@ function VMixer(rpcClient, clusterIP) {
             callback('callback', 'error', 'Invalid input stream_id.');
         }
     };
+
+    that.removeRegion = function (region_id, callback) {
+        log.info('removeRegion view:', view, 'page:', page, 'region_id:', region_id);
+        var stream_id = inputManager.getStreamFromInput(layoutProcessor.getInput(region_id));
+        if (stream_id) {
+            log.info('removeRegion view:', view, 'page:', page, 'stream_id:', stream_id);
+            removeInput(stream_id);
+            callback('callback', stream_id);
+        } else {
+            callback('callback', 'error', region_id);
+        }
+    }
 
     that.setLayout = function (layout, callback) {
         log.debug('setLayout, layout:', JSON.stringify(layout));
@@ -1084,11 +1105,11 @@ module.exports = function (rpcClient, selfRpcId, parentRpcId, clusterWorkerIP) {
     },
         processor = undefined;
 
-    that.init = function (service, config, belongTo, controller, mixView, callback) {
+    that.init = function (service, config, belongTo, controller, mixView, pageNum, callback) {
         if (processor === undefined) {
             if (service === 'mixing') {
                 processor = new VMixer(rpcClient, clusterWorkerIP);
-                processor.initialize(config, belongTo, controller, mixView, callback);
+                processor.initialize(config, belongTo, controller, mixView, pageNum, callback);
                 that.__proto__ = processor;
             } else if (service === 'transcoding') {
                 processor = new VTranscoder(rpcClient, clusterWorkerIP);
